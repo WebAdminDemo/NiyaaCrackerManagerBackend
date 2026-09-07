@@ -1,4 +1,5 @@
 import * as productService from "../services/product.service.js";
+import * as productImportService from "../services/productImport.service.js";
 import { pool } from "../config/database.js";
 
 export async function getAll(req, res, next) {
@@ -21,9 +22,34 @@ export async function getById(req, res, next) {
 
 export async function create(req, res, next) {
   try {
+    // Normal Add Product sends an object.
+    // Excel import sends the complete product list as an array.
+    if (Array.isArray(req.body)) {
+      if (req.body.length === 0) {
+        return res.status(400).json({
+          message: "Excel file contains no products.",
+        });
+      }
+
+      const products = await productImportService.replaceAllProducts(
+        pool,
+        req.body
+      );
+
+      return res.status(200).json(products);
+    }
+
     const product = await productService.createProduct(pool, req.body);
-    res.status(201).json(product);
+    return res.status(201).json(product);
   } catch (error) {
+    console.error("Product create/import error:", error);
+
+    if (Array.isArray(req.body)) {
+      return res.status(error.status || 500).json({
+        message: error.message || "Product Excel import failed.",
+      });
+    }
+
     next(error);
   }
 }
@@ -35,7 +61,6 @@ export async function update(req, res, next) {
       req.params.id,
       req.body
     );
-
     res.json(product);
   } catch (error) {
     next(error);
@@ -58,7 +83,6 @@ export async function updateStatus(req, res, next) {
       req.params.id,
       req.body
     );
-
     res.json(product);
   } catch (error) {
     next(error);
