@@ -58,7 +58,8 @@ function jsonValue(value, fallback) {
 function calculateAmounts(priceValue, discountValue) {
   const price = nullableNumber(priceValue);
 
-  
+  // IMPORTANT:
+  // Accept both discountPercent (new API) and discount_percent (old API).
   const discountPercent = isBlank(discountValue)
     ? 0
     : Number(discountValue);
@@ -121,8 +122,8 @@ function buildProduct(request, id, now) {
     discountAmount: amounts.discountAmount,
     amount: amounts.amount,
 
-    currency: nullableText(request.currency),
-    taxRate: nullableNumber(request.taxRate),
+    currency: nullableText(request.currency) || "INR",
+    taxRate: nullableNumber(request.taxRate) ?? 0,
 
     image: nullableText(request.image),
 
@@ -132,7 +133,7 @@ function buildProduct(request, id, now) {
         : jsonValue(request.tags, []),
 
     stockQuantity: nullableNumber(request.stockQuantity),
-    minOrderQty: nullableNumber(request.minOrderQty),
+    minOrderQty: nullableNumber(request.minOrderQty) ?? 1,
     maxOrderQty: nullableNumber(request.maxOrderQty),
 
     status:
@@ -152,7 +153,7 @@ function buildProduct(request, id, now) {
       request.lastUpdated ?? now,
 
     source:
-      nullableText(request.source),
+      nullableText(request.source) || "manual",
 
     descriptionVideo:
       nullableText(request.descriptionVideo),
@@ -211,7 +212,20 @@ export async function updateProduct(db, id, request) {
     );
   }
 
-  
+  /*
+   * Missing field:
+   *   keep the existing database value.
+   *
+   * Explicit null:
+   *   store NULL where the database column allows it.
+   *
+   * Empty string:
+   *   store an empty string for text fields.
+   *
+   * Discount:
+   *   accept BOTH discountPercent and discount_percent.
+   *   Recalculate discountAmount and amount from the ORIGINAL price.
+   */
 
   const priceInput =
     Object.prototype.hasOwnProperty.call(
