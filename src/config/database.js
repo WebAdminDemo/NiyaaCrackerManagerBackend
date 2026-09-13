@@ -45,3 +45,53 @@ export async function healthcheck() {
   await pool.query("SELECT 1");
   return true;
 }
+
+let orderItemBrandSchemaPromise;
+let productBrandSchemaPromise;
+
+export function ensureOrderItemBrandSchema() {
+  if (!orderItemBrandSchemaPromise) {
+    orderItemBrandSchemaPromise = pool
+      .query(
+        `ALTER TABLE enquiry_items
+         ADD COLUMN IF NOT EXISTS brand VARCHAR(150)`,
+      )
+      .catch((error) => {
+        orderItemBrandSchemaPromise = null;
+        throw error;
+      });
+  }
+
+  return orderItemBrandSchemaPromise;
+}
+
+export function ensureProductBrandSchema() {
+  if (!productBrandSchemaPromise) {
+    productBrandSchemaPromise = (async () => {
+      await pool.query(
+        `ALTER TABLE products
+         ADD COLUMN IF NOT EXISTS brand VARCHAR(50),
+         ADD COLUMN IF NOT EXISTS brand_status BOOLEAN`,
+      );
+
+      await pool.query(
+        `UPDATE products
+         SET brand = CASE
+           WHEN LOWER(TRIM(COALESCE(brand, ''))) IN ('standard', 'standard fireworks') THEN 'Standard'
+           WHEN LOWER(TRIM(COALESCE(brand, ''))) IN ('multibrand', 'multi-brand', 'multi brand') THEN 'Multibrand'
+           ELSE NULL
+         END,
+         brand_status = CASE
+           WHEN LOWER(TRIM(COALESCE(brand, ''))) IN ('standard', 'standard fireworks') THEN TRUE
+           WHEN LOWER(TRIM(COALESCE(brand, ''))) IN ('multibrand', 'multi-brand', 'multi brand') THEN FALSE
+           ELSE NULL
+         END`,
+      );
+    })().catch((error) => {
+        productBrandSchemaPromise = null;
+        throw error;
+      });
+  }
+
+  return productBrandSchemaPromise;
+}

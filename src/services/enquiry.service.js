@@ -9,17 +9,19 @@ import {
   insertSnapshot,
 } from "../repositories/enquiry.repository.js";
 import { findById as findProduct } from "../repositories/product.repository.js";
-import { generateOrderRef, uuid } from "../utils/reference.js";
+import { generateOrderRef } from "../utils/reference.js";
 import { badRequest, notFound } from "../utils/httpError.js";
+import { BRAND } from "../config/common.properties.js";
 
-const VALID_STATUS = new Set([
-  "pending",
-  "processing",
-  "packaging",
-  "shipped",
-  "delivered",
-  "cancelled",
-]);
+
+
+
+function normalizeBrand(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text === BRAND.STANDARD.toLowerCase() || text === "standard fireworks") return BRAND.STANDARD;
+  if ([BRAND.MULTIBRAND.toLowerCase(), "multi-brand", "multi brand"].includes(text)) return BRAND.MULTIBRAND;
+  return null;
+}
 
 function amount(v) {
   return new Decimal(v ?? 0);
@@ -45,9 +47,6 @@ export async function createOrder(request) {
       const product = await findProduct(client, item.productId, true);
       if (!product)
         throw notFound(`Product not found with id: ${item.productId}`);
-      if (product.status !== "in_stock")
-        throw badRequest(`${product.name || item.productId} is out of stock`);
-
       const qty = Number(item.quantity);
       if (!Number.isInteger(qty) || qty <= 0)
         throw badRequest(
@@ -59,14 +58,6 @@ export async function createOrder(request) {
         throw badRequest(`${product.name} minimum order quantity is ${min}`);
       if (max != null && qty > max)
         throw badRequest(`${product.name} maximum order quantity is ${max}`);
-
-      if (
-        product.stock_quantity != null &&
-        qty > product.stock_quantity &&
-        !product.backorder_allowed
-      ) {
-        throw badRequest(`Insufficient stock for ${product.name}`);
-      }
 
       const stockBefore = product.stock_quantity;
       const stockAfter = stockBefore == null ? null : stockBefore - qty;
@@ -93,6 +84,7 @@ export async function createOrder(request) {
         quantity: qty,
         total: lineTotal.toFixed(2),
         discountPercent: product.discount_percent ?? 0,
+        brand: normalizeBrand(item.brand) ?? normalizeBrand(product.brand),
         createdAt: now,
         stockBefore,
         stockAfter,
@@ -104,8 +96,16 @@ export async function createOrder(request) {
       ref,
       customerName: request.customerName,
       customerPhone: request.customerPhone,
+      customerAddress: request.customerAddress ?? null,
+      partySector: request.partySector ?? null,
+      partyCountry: request.partyCountry || "India",
+      partyState: request.partyState ?? null,
+      partyDistrict: request.partyDistrict ?? null,
+      partyLocality: request.partyLocality ?? null,
+      partyPincode: request.partyPincode ?? null,
+      brandMode: request.brandMode || "multiBrand",
       channel: request.channel || "whatsapp",
-      status: request.status || "pending",
+      status: request.status || "order_received",
       message: request.message ?? null,
       pdfLink: request.pdfLink ?? null,
       whatsappNumber: request.whatsappNumber ?? null,
@@ -151,12 +151,23 @@ function formatOrder(o) {
     quantity: i.quantity,
     total: i.total,
     discountPercent: i.discount_percent,
+    brand: normalizeBrand(i.brand) ?? normalizeBrand(i.product_brand),
   }));
   return {
     id: o.id,
     ref: o.ref,
     customerName: o.customer_name,
     customerPhone: o.customer_phone,
+    customerAddress: o.customer_address || null,
+    partyNumber: o.customer_phone || null,
+    partyAddress: o.customer_address || null,
+    partySector: o.party_sector || null,
+    partyCountry: o.party_country || null,
+    partyState: o.party_state || null,
+    partyDistrict: o.party_district || null,
+    partyLocality: o.party_locality || null,
+    partyPincode: o.party_pincode || null,
+    brandMode: o.brand_mode || "multiBrand",
     channel: o.channel,
     status: o.status || "pending",
     message: o.message,

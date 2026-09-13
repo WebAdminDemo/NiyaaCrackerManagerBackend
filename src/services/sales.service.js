@@ -2,162 +2,273 @@ import Decimal from "decimal.js";
 import { pool } from "../config/database.js";
 import {
   findAllWithItems,
+  findItems,
   topCustomers,
   updateStatus as updateOrderStatus,
+  updateOrderItems,
+  updateOrderDetails,
 } from "../repositories/enquiry.repository.js";
 import { notFound } from "../utils/httpError.js";
 
 const VALID_STATUSES = [
+  "order_received",
   "pending",
-  "processing",
-  "packaging",
   "shipped",
   "delivered",
+  "processing",
+  "packaging",
   "cancelled",
 ];
 
-function hasText(v) {
-  return v != null && String(v).trim() !== "";
-}
-function normalize(v, fallback = "") {
-  return hasText(v) ? String(v).trim().toLowerCase() : fallback;
-}
-function money(v) {
-  return new Decimal(v ?? 0);
+function hasText(value) {
+  return value != null && String(value).trim() !== "";
 }
 
-function mapOrder(o) {
-  const items = (o.items || []).map((i) => ({
-    id: i.id,
-    productId: i.product_id,
-    name: i.name,
-    category: i.category,
-    price: i.price,
-    quantity: i.quantity,
-    total:
-      i.total ??
-      money(i.price)
-        .mul(i.quantity || 0)
-        .toFixed(2),
-    discountPercent: i.discount_percent,
-  }));
+function normalize(value, fallback = "") {
+  return hasText(value) ? String(value).trim().toLowerCase() : fallback;
+}
+
+function money(value) {
+  return new Decimal(value ?? 0);
+}
+
+function mapOrder(order) {
+  const items = (order.items || []).map((item) => {
+    return {
+      id: item.id,
+      productId: item.product_id,
+      name: item.name,
+      category: item.category,
+      contents: item.contents,
+      originalPrice: item.original_price,
+      price: item.price,
+      quantity: item.quantity,
+      total:
+        item.total ??
+        money(item.price)
+          .mul(item.quantity || 0)
+          .toFixed(2),
+      discountPercent: item.discount_percent,
+      brand: item.brand || item.product_brand || null,
+      brandStatus:
+        item.product_brand_status === null || item.product_brand_status === undefined
+          ? null
+          : item.product_brand_status === true ||
+            item.product_brand_status === 1 ||
+            String(item.product_brand_status).trim() === "1",
+      stockQuantity:
+        item.stock_quantity == null ? null : Number(item.stock_quantity),
+    };
+  });
+
   return {
-    id: o.id,
-    ref: o.ref,
-    customerName: o.customer_name,
-    customerPhone: o.customer_phone,
-    channel: o.channel,
-    status: normalize(o.status, "pending"),
+    id: order.id,
+    ref: order.ref,
+    customerName: order.customer_name,
+    customerPhone: order.customer_phone,
+    customerAddress: order.customer_address || null,
+    partyName: order.customer_name,
+    partyNumber: order.customer_phone,
+    partyAddress: order.customer_address || null,
+    partySector: order.party_sector || null,
+    partyCountry: order.party_country || null,
+    partyState: order.party_state || null,
+    partyDistrict: order.party_district || null,
+    partyLocality: order.party_locality || null,
+    partyPincode: order.party_pincode || null,
+    brandMode: order.brand_mode || "multiBrand",
+    channel: order.channel,
+    status: normalize(order.status, "order_received"),
+    message: order.message,
+    pdfLink: order.pdf_link,
+    whatsappNumber: order.whatsapp_number,
+    smsNumber: order.sms_number,
     totalAmount:
-      o.total_amount ??
-      items.reduce((s, i) => s.plus(money(i.total)), new Decimal(0)).toFixed(2),
-    totalItems: o.total_items ?? items.length,
-    totalQuantity: o.total_quantity,
-    orderDate: o.order_date,
-    createdAt: o.created_at,
+      order.total_amount ??
+      items
+        .reduce((sum, item) => sum.plus(money(item.total)), new Decimal(0))
+        .toFixed(2),
+    totalItems: order.total_items ?? items.length,
+    totalQuantity:
+      order.total_quantity ??
+      items.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    orderDate: order.order_date,
+    createdAt: order.created_at,
+    updatedAt: order.updated_at,
     items,
   };
 }
-function orderDate(o) {
-  return o.order_date || o.created_at;
+
+function orderDate(order) {
+  return order.order_date || order.created_at;
 }
-function matchesDate(o, from, to) {
+
+function matchesDate(order, from, to) {
   if (!from && !to) return true;
-  const d = orderDate(o);
-  if (!d) return false;
-  const day = new Date(d).toISOString().slice(0, 10);
+
+  const value = orderDate(order);
+  if (!value) return false;
+
+  const day = new Date(value).toISOString().slice(0, 10);
+
   return (!from || day >= from) && (!to || day <= to);
 }
-function matches(o, status, category, channel, search) {
-  if (status && normalize(o.status) !== normalize(status)) return false;
-  if (channel && normalize(o.channel) !== normalize(channel)) return false;
+
+function matches(order, status, category, channel, brand, search) {
+  if (status && normalize(order.status) !== normalize(status)) {
+    return false;
+  }
+
+  if (channel && normalize(order.channel) !== normalize(channel)) {
+    return false;
+  }
+
   if (
     category &&
-    !(o.items || []).some((i) => normalize(i.category) === normalize(category))
-  )
+    !(order.items || []).some(
+      (item) => normalize(item.category) === normalize(category),
+    )
+  ) {
     return false;
+  }
+
+  if (
+    brand &&
+    !(order.items || []).some(
+      (item) => normalize(item.brand) === normalize(brand),
+    )
+  ) {
+    return false;
+  }
+
   if (search) {
-    const n = String(search).trim().toLowerCase();
+    const needle = String(search).trim().toLowerCase();
+
     const found = [
-      o.ref,
-      o.id,
-      o.customer_name,
-      o.customer_phone,
-      ...(o.items || []).map((i) => i.name),
-    ].some((v) => v != null && String(v).toLowerCase().includes(n));
+      order.ref,
+      order.id,
+      order.customer_name,
+      order.customer_phone,
+      order.party_sector,
+      order.party_state,
+      order.party_district,
+      order.party_locality,
+      ...(order.items || []).map((item) => item.name),
+    ].some(
+      (value) => value != null && String(value).toLowerCase().includes(needle),
+    );
+
     if (!found) return false;
   }
+
   return true;
 }
-async function filtered({ from, to, status, category, channel, search }) {
+
+async function filtered({ from, to, status, category, channel, brand, search }) {
   const orders = await findAllWithItems(pool);
+
   return orders.filter(
-    (o) =>
-      matchesDate(o, from, to) && matches(o, status, category, channel, search),
+    (order) =>
+      matchesDate(order, from, to) &&
+      matches(order, status, category, channel, brand, search),
   );
 }
-export async function findOrders(filters) {
+
+export async function findOrders(filters = {}) {
   return (await filtered(filters)).map(mapOrder);
 }
 
-export async function getAnalytics(filters) {
+export async function getAnalytics(filters = {}) {
   const orders = await filtered(filters);
+
   const totalRevenue = orders.reduce(
-    (s, o) => s.plus(o.total_amount || 0),
+    (sum, order) => sum.plus(order.total_amount || 0),
     new Decimal(0),
   );
-  const totalItems = orders.reduce((s, o) => s + (o.items || []).length, 0);
-  const totalQuantity = orders.reduce(
-    (s, o) => s + (o.items || []).reduce((q, i) => q + (i.quantity || 0), 0),
+
+  const totalItems = orders.reduce(
+    (sum, order) => sum + (order.items || []).length,
     0,
   );
-  const totalCustomers = new Set(
-    orders.map((o) => o.customer_phone).filter(hasText),
-  ).size;
-  const statusCounts = Object.fromEntries(
-    [...VALID_STATUSES].sort().map((s) => [s, 0]),
+
+  const totalQuantity = orders.reduce(
+    (sum, order) =>
+      sum +
+      (order.items || []).reduce(
+        (quantity, item) => quantity + Number(item.quantity || 0),
+        0,
+      ),
+    0,
   );
+
+  const totalCustomers = new Set(
+    orders.map((order) => order.customer_phone).filter(hasText),
+  ).size;
+
+  const statusCounts = Object.fromEntries(
+    VALID_STATUSES.map((status) => [status, 0]),
+  );
+
   const categoryRevenue = {};
   const daily = {};
   const channelDistribution = {};
   const productRevenue = {};
   const productQuantity = {};
-  for (const o of orders) {
-    const st = normalize(o.status, "pending");
-    statusCounts[st] = (statusCounts[st] || 0) + 1;
-    if (hasText(o.channel))
-      channelDistribution[o.channel] =
-        (channelDistribution[o.channel] || 0) + 1;
-    const day =
-      orderDate(o)?.toISOString?.().slice(0, 10) ||
-      (orderDate(o) ? String(orderDate(o)).slice(0, 10) : null);
-    if (day) {
-      if (!daily[day]) daily[day] = { revenue: new Decimal(0), orders: 0 };
-      daily[day].revenue = daily[day].revenue.plus(o.total_amount || 0);
-      daily[day].orders++;
+
+  for (const order of orders) {
+    const status = normalize(order.status, "order_received");
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+    if (hasText(order.channel)) {
+      channelDistribution[order.channel] =
+        (channelDistribution[order.channel] || 0) + 1;
     }
-    for (const i of o.items || []) {
-      const cat = hasText(i.category) ? i.category : "Uncategorised";
-      categoryRevenue[cat] = money(categoryRevenue[cat])
-        .plus(i.total || money(i.price).mul(i.quantity || 0))
+
+    const rawDate = orderDate(order);
+    const day = rawDate ? new Date(rawDate).toISOString().slice(0, 10) : null;
+
+    if (day) {
+      if (!daily[day]) {
+        daily[day] = {
+          revenue: new Decimal(0),
+          orders: 0,
+        };
+      }
+
+      daily[day].revenue = daily[day].revenue.plus(order.total_amount || 0);
+      daily[day].orders += 1;
+    }
+
+    for (const item of order.items || []) {
+      const category = hasText(item.category) ? item.category : "Uncategorised";
+
+      const lineTotal = item.total ?? money(item.price).mul(item.quantity || 0);
+
+      categoryRevenue[category] = money(categoryRevenue[category])
+        .plus(lineTotal)
         .toFixed(2);
-      productRevenue[i.name] = money(productRevenue[i.name])
-        .plus(i.total || money(i.price).mul(i.quantity || 0))
+
+      productRevenue[item.name] = money(productRevenue[item.name])
+        .plus(lineTotal)
         .toFixed(2);
-      productQuantity[i.name] =
-        (productQuantity[i.name] || 0) + (i.quantity || 0);
+
+      productQuantity[item.name] =
+        (productQuantity[item.name] || 0) + Number(item.quantity || 0);
     }
   }
+
   const sortedCategoryRevenue = Object.fromEntries(
     Object.entries(categoryRevenue).sort((a, b) => money(b[1]).cmp(a[1])),
   );
+
   const dailyRevenue = Object.entries(daily)
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, x]) => ({
+    .map(([date, value]) => ({
       date,
-      revenue: x.revenue.toFixed(2),
-      orders: x.orders,
+      revenue: value.revenue.toFixed(2),
+      orders: value.orders,
     }));
+
   const topProducts = Object.entries(productRevenue)
     .map(([name, revenue]) => ({
       name,
@@ -166,14 +277,17 @@ export async function getAnalytics(filters) {
     }))
     .sort((a, b) => money(b.revenue).cmp(a.revenue))
     .slice(0, 6);
+
   const top = await topCustomers(pool);
-  const topCustomersDto = top.slice(0, 5).map((r) => ({
-    name: r.customer_name,
-    phone: r.customer_phone,
-    orders: Number(r.order_count),
-    revenue: String(r.total_amount),
-    lastOrder: r.last_order,
+
+  const topCustomersDto = top.slice(0, 5).map((row) => ({
+    name: row.customer_name,
+    phone: row.customer_phone,
+    orders: Number(row.order_count),
+    revenue: String(row.total_amount),
+    lastOrder: row.last_order,
   }));
+
   return {
     totalRevenue: totalRevenue.toFixed(2),
     totalOrders: orders.length,
@@ -188,26 +302,46 @@ export async function getAnalytics(filters) {
     topCustomers: topCustomersDto,
   };
 }
+
 export async function updateStatus(id, status) {
   const normalized = normalize(status, "");
+
   if (!VALID_STATUSES.includes(normalized)) {
-    const e = new Error("Unsupported order status");
-    e.status = 400;
-    throw e;
+    const error = new Error("Unsupported order status");
+    error.status = 400;
+    throw error;
   }
+
   const row = await updateOrderStatus(pool, id, normalized);
+
   if (!row) throw notFound("Order not found");
-  const items = await (
-    await import("../repositories/enquiry.repository.js")
-  ).findItems(pool, id);
+
+  const items = await findItems(pool, id);
+
   return mapOrder({ ...row, items });
 }
+
+export async function updateItems(id, items) {
+  const updated = await updateOrderItems(id, items);
+  return mapOrder(updated);
+}
+
+export async function updateOrder(id, details, items) {
+  const updated = await updateOrderDetails(
+    id,
+    details || {},
+    Array.isArray(items) ? items : [],
+  );
+
+  return mapOrder(updated);
+}
+
 export async function getTopCustomers() {
-  return (await topCustomers(pool)).map((r) => ({
-    name: r.customer_name,
-    phone: r.customer_phone,
-    orders: Number(r.order_count),
-    revenue: String(r.total_amount),
-    lastOrder: r.last_order,
+  return (await topCustomers(pool)).map((row) => ({
+    name: row.customer_name,
+    phone: row.customer_phone,
+    orders: Number(row.order_count),
+    revenue: String(row.total_amount),
+    lastOrder: row.last_order,
   }));
 }

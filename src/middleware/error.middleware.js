@@ -20,6 +20,10 @@ export function errorHandler(err, req, res, _next) {
     });
   }
 
+  if (Number.isInteger(err?.status) && err.status >= 400 && err.status < 600) {
+    return res.status(err.status).json({ message: err.message || "Request failed" });
+  }
+
   if (err?.code === "23505") {
     return res
       .status(409)

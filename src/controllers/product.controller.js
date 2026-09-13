@@ -1,4 +1,5 @@
 import * as productService from "../services/product.service.js";
+import * as productImportService from "../services/productImport.service.js";
 import { pool } from "../config/database.js";
 
 export async function getAll(req, res, next) {
@@ -60,6 +61,21 @@ export async function updateStatus(req, res, next) {
     );
 
     res.json(product);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function importProducts(req, res, next) {
+  try {
+    if (!Array.isArray(req.body) || req.body.length === 0) {
+      const error = new Error("Excel import payload must be a non-empty array.");
+      error.status = 400;
+      throw error;
+    }
+
+    const products = await productImportService.replaceAllProducts(pool, req.body);
+    res.json(products);
   } catch (error) {
     next(error);
   }

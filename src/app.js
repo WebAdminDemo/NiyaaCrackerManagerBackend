@@ -4,7 +4,7 @@ import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
-import { healthcheck } from "./config/database.js";
+import { ensureOrderItemBrandSchema, ensureProductBrandSchema, healthcheck } from "./config/database.js";
 import productRoutes from "./routes/product.routes.js";
 import enquiryRoutes from "./routes/enquiry.routes.js";
 import enquiryItemRoutes from "./routes/enquiry-item.routes.js";
@@ -32,7 +32,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   }),
 );
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(
   rateLimit({
     windowMs: 60000,
@@ -41,6 +41,16 @@ app.use(
     legacyHeaders: false,
   }),
 );
+
+app.use(async (_req, _res, next) => {
+  try {
+    await ensureProductBrandSchema();
+    await ensureOrderItemBrandSchema();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get("/health", async (req, res, next) => {
   try {

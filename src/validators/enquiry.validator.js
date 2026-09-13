@@ -10,6 +10,7 @@ const itemSchema = z.object({
   quantity: z.coerce.number().int().positive(),
   total: z.coerce.number().nonnegative().optional().nullable(),
   discountPercent: z.coerce.number().min(0).max(100).optional().nullable(),
+  brand: z.string().trim().optional().nullable(),
 });
 
 export const enquirySchema = z.object({
@@ -17,6 +18,14 @@ export const enquirySchema = z.object({
   ref: z.string().optional().nullable(),
   customerName: z.string().trim().min(1, "Customer name is required"),
   customerPhone: z.string().trim().min(1, "Customer phone is required"),
+  customerAddress: z.string().trim().optional().nullable(),
+  partySector: z.string().trim().optional().nullable(),
+  partyCountry: z.string().trim().optional().nullable(),
+  partyState: z.string().trim().optional().nullable(),
+  partyDistrict: z.string().trim().optional().nullable(),
+  partyLocality: z.string().trim().optional().nullable(),
+  partyPincode: z.string().trim().optional().nullable(),
+  brandMode: z.enum(["multiBrand", "standard"]).optional(),
   channel: z.string().optional().nullable(),
   status: z.string().optional().nullable(),
   message: z.string().optional().nullable(),
@@ -32,7 +41,7 @@ export const enquirySchema = z.object({
 
 export const salesStatusSchema = z.object({
   status: z.enum(
-    ["pending", "processing", "packaging", "shipped", "delivered", "cancelled"],
+    ["order_received", "pending", "shipped", "delivered", "processing", "packaging", "cancelled"],
     {
       message: "Unsupported order status",
     },
