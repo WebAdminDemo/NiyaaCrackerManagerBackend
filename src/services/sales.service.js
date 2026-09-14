@@ -258,7 +258,34 @@ function mapOrder(order) {
           .mul(item.quantity || 0)
           .toFixed(2),
 
-      discountPercent: item.discount_percent,
+      discountType:
+        item.discount_type === "value"
+          ? "value"
+          : "percent",
+
+      discountValue:
+        item.discount_value !== null &&
+        item.discount_value !== undefined
+          ? Number(item.discount_value)
+          : item.discount_type === "value"
+            ? Number(item.discount_amount ?? 0)
+            : Number(item.discount_percent ?? 0),
+
+      discountPercent:
+        item.discount_percent !== null &&
+        item.discount_percent !== undefined
+          ? Number(item.discount_percent)
+          : 0,
+
+      discountAmount:
+        item.discount_amount !== null &&
+        item.discount_amount !== undefined
+          ? Number(item.discount_amount)
+          : Math.max(
+              0,
+              Number(item.original_price ?? 0) -
+                Number(item.price ?? 0),
+            ),
 
       brand: item.brand || item.product_brand || null,
 

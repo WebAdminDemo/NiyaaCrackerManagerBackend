@@ -1,5 +1,4 @@
 import { pool } from "../config/database.js";
-import { BRAND, BRAND_STATUS } from "../config/common.properties.js";
 
 const ORDER_COLUMNS = `
   id,
@@ -40,13 +39,15 @@ const ITEM_COLUMNS = `
   ei.quantity,
   ei.total,
   ei.discount_percent,
+  ei.discount_type,
+  ei.discount_value,
+  ei.discount_amount,
   ei.brand,
   ei.created_at,
   ei.updated_at,
   p.stock_quantity,
   p.ui_flags AS product_ui_flags,
-  p.brand AS product_brand,
-  p.brand_status AS product_brand_status
+  p.brand AS product_brand
 `;
 
 export async function exists(id, client = pool) {
@@ -138,9 +139,12 @@ export async function insertItem(item, client = pool) {
       quantity,
       total,
       discount_percent,
+      discount_type,
+      discount_value,
+      discount_amount,
       brand
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     RETURNING *
     `,
     [
@@ -153,8 +157,11 @@ export async function insertItem(item, client = pool) {
       item.price,
       item.quantity,
       item.total,
-      item.discountPercent,
-      item.brand || null,
+      item.discountPercent ?? 0,
+      item.discountType || "percent",
+      item.discountValue ?? item.discountPercent ?? 0,
+      item.discountAmount ?? 0,
+      item.brand ?? null,
     ],
   );
 
@@ -202,11 +209,14 @@ export async function findAll() {
               'category', i.category,
               'contents', i.contents,
               'discountPercent', i.discount_percent,
+              'discountType', i.discount_type,
+              'discountValue', i.discount_value,
+              'discountAmount', i.discount_amount,
+              'brand', i.brand,
               'originalPrice', i.original_price,
               'price', i.price,
               'quantity', i.quantity,
-              'total', i.total,
-              'brand', i.brand
+              'total', i.total
             ) ORDER BY i.id
           )
           FROM enquiry_items i
@@ -282,7 +292,9 @@ export async function findAllWithItems(db = pool) {
     [ids],
   );
 
-  const byOrder = new Map(orders.map((order) => [order.id, []]));
+  const byOrder = new Map(
+    orders.map((order) => [order.id, []]),
+  );
 
   items.forEach((item) => {
     byOrder.get(item.enquiry_id)?.push(item);
@@ -340,34 +352,14 @@ export async function updateStatus(db = pool, id, status) {
   return rows[0] || null;
 }
 
-function normalizeProductBrand(value) {
-  const text = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  if ([BRAND.STANDARD.toLowerCase(), "standard fireworks"].includes(text))
-    return BRAND.STANDARD;
-  if (
-    [BRAND.MULTIBRAND.toLowerCase(), "multi-brand", "multi brand"].includes(
-      text,
-    )
-  )
-    return BRAND.MULTIBRAND;
-  return null;
-}
-
-function brandStatus(value) {
-  const brand = normalizeProductBrand(value);
-  if (brand === BRAND.STANDARD) return BRAND_STATUS.STANDARD;
-  if (brand === BRAND.MULTIBRAND) return BRAND_STATUS.MULTIBRAND;
-  return BRAND_STATUS.EMPTY;
-}
-
 async function adjustStock(client, productId, delta) {
+  if (!delta) return;
+
   const result = await client.query(
     `
     SELECT id, name, category, contents, price, amount,
-           discount_percent, status, stock_quantity,
-           ui_flags, brand, brand_status
+           discount_percent, brand, status, stock_quantity,
+           ui_flags
     FROM products
     WHERE id = $1
     FOR UPDATE
@@ -383,7 +375,28 @@ async function adjustStock(client, productId, delta) {
     throw error;
   }
 
-  if (product.stock_quantity !== null && delta) {
+  if (delta > 0) {
+    if (String(product.status || "").toLowerCase() !== "in_stock") {
+      const error = new Error(
+        `${product.name || "Product"} is not available.`,
+      );
+      error.status = 400;
+      throw error;
+    }
+
+    if (
+      product.stock_quantity !== null &&
+      Number(product.stock_quantity) < delta
+    ) {
+      const error = new Error(
+        `Insufficient stock for ${product.name || "Product"}. Available: ${product.stock_quantity}`,
+      );
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  if (product.stock_quantity !== null) {
     await client.query(
       `
       UPDATE products
@@ -418,7 +431,7 @@ export async function updateOrderItems(id, requestedItems = []) {
 
     const existingResult = await client.query(
       `
-      SELECT id, product_id, quantity, price, brand
+      SELECT id, product_id, quantity, price
       FROM enquiry_items
       WHERE enquiry_id = $1
       FOR UPDATE
@@ -428,13 +441,18 @@ export async function updateOrderItems(id, requestedItems = []) {
 
     const existingItems = existingResult.rows;
     const requested = new Map();
-    const requestedBrands = new Map();
 
     for (const item of requestedItems) {
-      const productId = String(item?.productId ?? item?.id ?? "").trim();
+      const productId = String(
+        item?.productId ?? item?.id ?? "",
+      ).trim();
       const quantity = Number(item?.quantity);
 
-      if (!productId || !Number.isInteger(quantity) || quantity < 1) {
+      if (
+        !productId ||
+        !Number.isInteger(quantity) ||
+        quantity < 1
+      ) {
         const error = new Error(
           "Every selected product must have a quantity greater than zero.",
         );
@@ -443,13 +461,14 @@ export async function updateOrderItems(id, requestedItems = []) {
       }
 
       if (requested.has(productId)) {
-        const error = new Error(`Duplicate product in order: ${productId}`);
+        const error = new Error(
+          `Duplicate product in order: ${productId}`,
+        );
         error.status = 400;
         throw error;
       }
 
       requested.set(productId, quantity);
-      requestedBrands.set(productId, normalizeProductBrand(item?.brand));
     }
 
     if (!requested.size) {
@@ -462,15 +481,25 @@ export async function updateOrderItems(id, requestedItems = []) {
       existingItems.map((item) => [String(item.product_id), item]),
     );
 
+    // Removed products: return their reserved quantity to stock and remove
+    // the order line.
     for (const item of existingItems) {
       const productId = String(item.product_id);
       if (requested.has(productId)) continue;
 
-      await adjustStock(client, item.product_id, -Number(item.quantity || 0));
+      await adjustStock(
+        client,
+        item.product_id,
+        -Number(item.quantity || 0),
+      );
 
-      await client.query(`DELETE FROM enquiry_items WHERE id = $1`, [item.id]);
+      await client.query(
+        `DELETE FROM enquiry_items WHERE id = $1`,
+        [item.id],
+      );
     }
 
+    // Existing products: only the quantity delta changes stock.
     for (const [productId, nextQuantity] of requested.entries()) {
       const existing = existingByProduct.get(productId);
 
@@ -487,37 +516,15 @@ export async function updateOrderItems(id, requestedItems = []) {
         `
         UPDATE enquiry_items
         SET quantity = $1,
-            brand = $2,
-            total = ROUND(price * $4::numeric, 2),
+            total = ROUND(price * $1, 2),
             updated_at = NOW()
-        WHERE id = $3
+        WHERE id = $2
         `,
-        [
-          nextQuantity,
-          requestedBrands.has(productId)
-            ? requestedBrands.get(productId)
-            : normalizeProductBrand(existing.brand),
-          existing.id,
-          nextQuantity,
-        ],
-      );
-
-      const nextBrand = requestedBrands.has(productId)
-        ? requestedBrands.get(productId)
-        : normalizeProductBrand(existing.brand);
-      await client.query(
-        `
-        UPDATE products
-        SET brand = $1,
-            brand_status = $2,
-            updated_at = NOW(),
-            last_updated = NOW()
-        WHERE id = $3
-        `,
-        [nextBrand, brandStatus(nextBrand), existing.product_id],
+        [nextQuantity, existing.id],
       );
     }
 
+    // New products: use the current product price/details and reserve stock.
     for (const [productId, quantity] of requested.entries()) {
       if (existingByProduct.has(productId)) continue;
 
@@ -537,26 +544,9 @@ export async function updateOrderItems(id, requestedItems = []) {
           quantity,
           total,
           discountPercent: product.discount_percent ?? 0,
-          brand: requestedBrands.has(productId)
-            ? requestedBrands.get(productId)
-            : normalizeProductBrand(product.brand),
+          brand: product.brand ?? null,
         },
         client,
-      );
-
-      const selectedBrand = requestedBrands.has(productId)
-        ? requestedBrands.get(productId)
-        : normalizeProductBrand(product.brand);
-      await client.query(
-        `
-        UPDATE products
-        SET brand = $1,
-            brand_status = $2,
-            updated_at = NOW(),
-            last_updated = NOW()
-        WHERE id = $3
-        `,
-        [selectedBrand, brandStatus(selectedBrand), product.id],
       );
 
       const stockAfter =
@@ -600,7 +590,12 @@ export async function updateOrderItems(id, requestedItems = []) {
       WHERE id = $4
       RETURNING ${ORDER_COLUMNS}
       `,
-      [totals.total_items, totals.total_quantity, totals.total_amount, id],
+      [
+        totals.total_items,
+        totals.total_quantity,
+        totals.total_amount,
+        id,
+      ],
     );
 
     const updated = updatedResult.rows[0];
@@ -689,7 +684,15 @@ export async function updateOrderDetails(
 
     const existingResult = await client.query(
       `
-      SELECT id, product_id, quantity, price, brand
+      SELECT id,
+             product_id,
+             quantity,
+             original_price,
+             price,
+             discount_percent,
+             discount_type,
+             discount_value,
+             discount_amount
       FROM enquiry_items
       WHERE enquiry_id = $1
       FOR UPDATE
@@ -699,13 +702,19 @@ export async function updateOrderDetails(
 
     const existingItems = existingResult.rows;
     const requested = new Map();
-    const requestedBrands = new Map();
 
-    for (const item of requestedItems) {
-      const productId = String(item?.productId ?? item?.id ?? "").trim();
+    for (const item of requestedItems || []) {
+      const productId = String(
+        item?.productId ?? item?.id ?? "",
+      ).trim();
+
       const quantity = Number(item?.quantity);
 
-      if (!productId || !Number.isInteger(quantity) || quantity < 1) {
+      if (
+        !productId ||
+        !Number.isInteger(quantity) ||
+        quantity < 1
+      ) {
         const error = new Error(
           "Every selected product must have a quantity greater than zero.",
         );
@@ -714,25 +723,84 @@ export async function updateOrderDetails(
       }
 
       if (requested.has(productId)) {
-        const error = new Error(`Duplicate product in order: ${productId}`);
+        const error = new Error(
+          `Duplicate product in order: ${productId}`,
+        );
         error.status = 400;
         throw error;
       }
 
-      requested.set(productId, quantity);
-      requestedBrands.set(productId, normalizeProductBrand(item?.brand));
+      let originalPrice = Number(item?.originalPrice);
+      if (!Number.isFinite(originalPrice) || originalPrice < 0) {
+        originalPrice = 0;
+      }
+
+      let discountType =
+        item?.discountType === "value"
+          ? "value"
+          : "percent";
+
+      let discountValue = Number(item?.discountValue);
+      if (!Number.isFinite(discountValue) || discountValue < 0) {
+        discountValue = 0;
+      }
+
+      if (discountType === "percent") {
+        discountValue = Math.min(100, discountValue);
+      } else {
+        discountValue = Math.min(originalPrice, discountValue);
+      }
+
+      const price =
+        discountType === "value"
+          ? Math.max(0, originalPrice - discountValue)
+          : Math.max(
+              0,
+              originalPrice *
+                (1 - Math.min(100, discountValue) / 100),
+            );
+
+      const discountAmount = Math.max(
+        0,
+        originalPrice - price,
+      );
+
+      const discountPercent =
+        originalPrice > 0
+          ? (discountAmount / originalPrice) * 100
+          : 0;
+
+      requested.set(productId, {
+        quantity,
+        originalPrice,
+        price,
+        discountType,
+        discountValue,
+        discountAmount,
+        discountPercent,
+        brand:
+          item?.brand !== undefined && item?.brand !== null
+            ? String(item.brand).trim() || null
+            : null,
+      });
     }
 
     if (!requested.size) {
-      const error = new Error("An order must contain at least one product.");
+      const error = new Error(
+        "An order must contain at least one product.",
+      );
       error.status = 400;
       throw error;
     }
 
     const existingByProduct = new Map(
-      existingItems.map((item) => [String(item.product_id), item]),
+      existingItems.map((item) => [
+        String(item.product_id),
+        item,
+      ]),
     );
 
+    // Remove lines that were deselected.
     for (const existing of existingItems) {
       const productId = String(existing.product_id);
 
@@ -744,64 +812,127 @@ export async function updateOrderDetails(
         -Number(existing.quantity || 0),
       );
 
-      await client.query(`DELETE FROM enquiry_items WHERE id = $1`, [
-        existing.id,
-      ]);
+      await client.query(
+        `DELETE FROM enquiry_items WHERE id = $1`,
+        [existing.id],
+      );
     }
 
-    for (const [productId, nextQuantity] of requested.entries()) {
+    // Update existing order lines, including the ORDER-SPECIFIC discount.
+    // Never update the products table: catalog pricing/discount remains unchanged.
+    for (const [productId, requestedItem] of requested.entries()) {
       const existing = existingByProduct.get(productId);
 
       if (!existing) continue;
 
       const oldQuantity = Number(existing.quantity || 0);
-      const delta = nextQuantity - oldQuantity;
+      const delta = requestedItem.quantity - oldQuantity;
 
       if (delta) {
-        await adjustStock(client, existing.product_id, delta);
+        await adjustStock(
+          client,
+          existing.product_id,
+          delta,
+        );
       }
+
+      const lineTotal = (
+        requestedItem.price *
+        requestedItem.quantity
+      ).toFixed(2);
 
       await client.query(
         `
         UPDATE enquiry_items
-        SET quantity = $1,
-            brand = $2,
-            total = ROUND(price * $4::numeric, 2),
+        SET original_price = $1,
+            price = $2,
+            quantity = $3,
+            total = $4,
+            discount_percent = $5,
+            discount_type = $6,
+            discount_value = $7,
+            discount_amount = $8,
+            brand = COALESCE($9, brand),
             updated_at = NOW()
-        WHERE id = $3
+        WHERE id = $10
         `,
         [
-          nextQuantity,
-          requestedBrands.has(productId)
-            ? requestedBrands.get(productId)
-            : normalizeProductBrand(existing.brand),
+          requestedItem.originalPrice,
+          requestedItem.price.toFixed(2),
+          requestedItem.quantity,
+          lineTotal,
+          requestedItem.discountPercent.toFixed(2),
+          requestedItem.discountType,
+          requestedItem.discountValue.toFixed(2),
+          requestedItem.discountAmount.toFixed(2),
+          requestedItem.brand,
           existing.id,
-          nextQuantity,
         ],
-      );
-
-      const nextBrand = requestedBrands.has(productId)
-        ? requestedBrands.get(productId)
-        : normalizeProductBrand(existing.brand);
-      await client.query(
-        `
-        UPDATE products
-        SET brand = $1,
-            brand_status = $2,
-            updated_at = NOW(),
-            last_updated = NOW()
-        WHERE id = $3
-        `,
-        [nextBrand, brandStatus(nextBrand), existing.product_id],
       );
     }
 
-    for (const [productId, quantity] of requested.entries()) {
+    // Add newly selected products. New products start with their catalog
+    // discount unless the frontend explicitly supplied an order discount.
+    for (const [productId, requestedItem] of requested.entries()) {
       if (existingByProduct.has(productId)) continue;
 
-      const product = await adjustStock(client, productId, quantity);
-      const price = Number(product.amount ?? product.price ?? 0);
-      const total = (price * quantity).toFixed(2);
+      const product = await adjustStock(
+        client,
+        productId,
+        requestedItem.quantity,
+      );
+
+      const catalogOriginalPrice = Number(
+        product.price ?? 0,
+      );
+
+      const hasExplicitDiscount =
+        requestedItem.discountType ||
+        requestedItem.discountValue > 0;
+
+      const originalPrice =
+        Number.isFinite(catalogOriginalPrice) &&
+        catalogOriginalPrice >= 0
+          ? catalogOriginalPrice
+          : requestedItem.originalPrice;
+
+      const discountType = hasExplicitDiscount
+        ? requestedItem.discountType
+        : "percent";
+
+      const discountValue = hasExplicitDiscount
+        ? requestedItem.discountValue
+        : Math.max(
+            0,
+            Math.min(
+              100,
+              Number(product.discount_percent ?? 0),
+            ),
+          );
+
+      const price =
+        discountType === "value"
+          ? Math.max(0, originalPrice - Math.min(originalPrice, discountValue))
+          : Math.max(
+              0,
+              originalPrice *
+                (1 - Math.min(100, discountValue) / 100),
+            );
+
+      const discountAmount = Math.max(
+        0,
+        originalPrice - price,
+      );
+
+      const discountPercent =
+        originalPrice > 0
+          ? (discountAmount / originalPrice) * 100
+          : 0;
+
+      const total = (
+        price *
+        requestedItem.quantity
+      ).toFixed(2);
 
       await insertItem(
         {
@@ -810,31 +941,17 @@ export async function updateOrderDetails(
           name: product.name,
           category: product.category,
           contents: product.contents,
-          originalPrice: product.price,
+          originalPrice,
           price,
-          quantity,
+          quantity: requestedItem.quantity,
           total,
-          discountPercent: product.discount_percent ?? 0,
-          brand: requestedBrands.has(productId)
-            ? requestedBrands.get(productId)
-            : normalizeProductBrand(product.brand),
+          discountPercent,
+          discountType,
+          discountValue,
+          discountAmount,
+          brand: requestedItem.brand ?? product.brand ?? null,
         },
         client,
-      );
-
-      const selectedBrand = requestedBrands.has(productId)
-        ? requestedBrands.get(productId)
-        : normalizeProductBrand(product.brand);
-      await client.query(
-        `
-        UPDATE products
-        SET brand = $1,
-            brand_status = $2,
-            updated_at = NOW(),
-            last_updated = NOW()
-        WHERE id = $3
-        `,
-        [selectedBrand, brandStatus(selectedBrand), product.id],
       );
 
       await insertSnapshot(
@@ -842,12 +959,13 @@ export async function updateOrderDetails(
           enquiryId: id,
           productId: product.id,
           productName: product.name,
-          quantityOrdered: quantity,
+          quantityOrdered: requestedItem.quantity,
           stockBefore: product.stock_quantity,
           stockAfter:
             product.stock_quantity == null
               ? null
-              : Number(product.stock_quantity) - quantity,
+              : Number(product.stock_quantity) -
+                requestedItem.quantity,
         },
         client,
       );
@@ -891,19 +1009,37 @@ export async function updateOrderDetails(
       [
         customerName,
         customerPhone,
-        details.customerAddress ?? order.customer_address ?? null,
-        details.partySector ?? order.party_sector ?? null,
-        details.partyCountry || order.party_country || "India",
-        details.partyState ?? order.party_state ?? null,
-        details.partyDistrict ?? order.party_district ?? null,
-        details.partyLocality ?? order.party_locality ?? null,
-        details.partyPincode ?? order.party_pincode ?? null,
-        details.brandMode || order.brand_mode || "multiBrand",
+        details.customerAddress ??
+          order.customer_address ??
+          null,
+        details.partySector ??
+          order.party_sector ??
+          null,
+        details.partyCountry ||
+          order.party_country ||
+          "India",
+        details.partyState ??
+          order.party_state ??
+          null,
+        details.partyDistrict ??
+          order.party_district ??
+          null,
+        details.partyLocality ??
+          order.party_locality ??
+          null,
+        details.partyPincode ??
+          order.party_pincode ??
+          null,
+        details.brandMode ||
+          order.brand_mode ||
+          "multiBrand",
         nextStatus,
         totals.total_items,
         totals.total_quantity,
         totals.total_amount,
-        details.orderDate ?? order.order_date ?? null,
+        details.orderDate ??
+          order.order_date ??
+          null,
         id,
       ],
     );
@@ -923,3 +1059,4 @@ export async function updateOrderDetails(
     client.release();
   }
 }
+
