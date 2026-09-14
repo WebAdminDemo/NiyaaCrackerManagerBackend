@@ -11,10 +11,9 @@ import {
 } from "../repositories/product.repository.js";
 
 import { productResponse } from "../utils/product.mapper.js";
-import { generateSku, uuid } from "../utils/reference.js";
+import { generateSku } from "../utils/reference.js";
 import { notFound } from "../utils/httpError.js";
 import { jsonText } from "../utils/json.js";
-import { BRAND, BRAND_STATUS, PRODUCT_STATUS } from "../config/common.properties.js";
 
 function isBlank(value) {
   return value === undefined || value === null || String(value).trim() === "";
@@ -44,21 +43,6 @@ function nullableText(value) {
   return isBlank(value) ? "" : String(value).trim();
 }
 
-function normalizeBrand(value) {
-  const normalized = String(value ?? "").trim().toLowerCase();
-  if (!normalized) return "";
-  if ([BRAND.STANDARD.toLowerCase(), "standard fireworks"].includes(normalized)) return BRAND.STANDARD;
-  if ([BRAND.MULTIBRAND.toLowerCase(), "multi-brand", "multi brand"].includes(normalized)) return BRAND.MULTIBRAND;
-  return "";
-}
-
-function getBrandStatus(value) {
-  const brand = normalizeBrand(value);
-  if (brand === BRAND.STANDARD) return BRAND_STATUS.STANDARD;
-  if (brand === BRAND.MULTIBRAND) return BRAND_STATUS.MULTIBRAND;
-  return BRAND_STATUS.EMPTY;
-}
-
 function jsonValue(value, fallback) {
   if (value === null) return null;
 
@@ -74,8 +58,8 @@ function jsonValue(value, fallback) {
 function calculateAmounts(priceValue, discountValue) {
   const price = nullableNumber(priceValue);
 
-  
-  
+  // IMPORTANT:
+  // Accept both discountPercent (new API) and discount_percent (old API).
   const discountPercent = isBlank(discountValue)
     ? 0
     : Number(discountValue);
@@ -154,7 +138,7 @@ function buildProduct(request, id, now) {
 
     status:
       nullableText(request.status) ||
-      PRODUCT_STATUS.IN_STOCK,
+      "in_stock",
 
     backorderAllowed:
       request.backorderAllowed ?? false,
@@ -176,9 +160,6 @@ function buildProduct(request, id, now) {
 
     updatedAt:
       request.updatedAt ?? now,
-
-    brand: normalizeBrand(request.brand),
-    brandStatus: getBrandStatus(request.brand),
 
     uiFlags:
       request.uiFlags === null
@@ -203,14 +184,32 @@ export async function getProductById(db, id) {
   return productResponse(row);
 }
 
-export async function createProduct(db, request) {
-  let id =
-    String(request.rowid ?? "").trim() ||
-    uuid();
+async function getNextProductId(db) {
+  // MAX(CAST(...)) supports existing numeric IDs stored as text/varchar.
+  // The returned value is converted back to the existing DB column type
+  // by PostgreSQL when it is inserted into products.id.
+  const { rows } = await db.query(`
+    SELECT COALESCE(
+      MAX(
+        CASE
+          WHEN TRIM(id::text) ~ '^[0-9]+$'
+          THEN TRIM(id::text)::numeric
+          ELSE 0
+        END
+      ),
+      0
+    ) + 1 AS next_id
+    FROM products
+  `);
 
-  if (await exists(db, id)) {
-    id = uuid();
-  }
+  return String(rows[0]?.next_id ?? 1);
+}
+
+export async function createProduct(db, request) {
+  // NEW products always receive the next sequential numeric ID.
+  // EDIT requests do not come through this method; updateProduct()
+  // continues to use the existing product ID unchanged.
+  const id = await getNextProductId(db);
 
   const now = new Date();
 
@@ -231,20 +230,20 @@ export async function updateProduct(db, id, request) {
     );
   }
 
-  
-
-
-
-
-
-
-
-
-
-
-
-
-
+  /*
+   * Missing field:
+   *   keep the existing database value.
+   *
+   * Explicit null:
+   *   store NULL where the database column allows it.
+   *
+   * Empty string:
+   *   store an empty string for text fields.
+   *
+   * Discount:
+   *   accept BOTH discountPercent and discount_percent.
+   *   Recalculate discountAmount and amount from the ORIGINAL price.
+   */
 
   const priceInput =
     Object.prototype.hasOwnProperty.call(
@@ -326,16 +325,6 @@ export async function updateProduct(db, id, request) {
     amount:
       amounts.amount,
 
-    brand:
-      Object.prototype.hasOwnProperty.call(request, "brand")
-        ? normalizeBrand(request.brand)
-        : normalizeBrand(existing.brand),
-
-    brandStatus:
-      Object.prototype.hasOwnProperty.call(request, "brand")
-        ? getBrandStatus(request.brand)
-        : getBrandStatus(existing.brand),
-
     lastUpdated: now,
     updatedAt: now,
   });
@@ -359,7 +348,7 @@ export async function updateProductStatus(
   status
 ) {
   if (
-    ![PRODUCT_STATUS.IN_STOCK, PRODUCT_STATUS.NO_STOCK].includes(status)
+    !["in_stock", "no_stock"].includes(status)
   ) {
     throw new Error("Invalid status value");
   }
