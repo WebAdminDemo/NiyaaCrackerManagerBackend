@@ -10,10 +10,17 @@ export const productRequestSchema = z
     discount_percent: z.coerce
       .number()
       .min(0, "Discount cannot be negative")
-      .max(100, "Discount cannot exceed 100")
       .optional()
       .nullable(),
-    discountPercent: z.coerce.number().min(0).max(100).optional().nullable(),
+    discountPercent: z.coerce
+      .number()
+      .min(0, "Discount cannot be negative")
+      .optional()
+      .nullable(),
+    discountMode: z.enum(['percent', 'value']).optional().nullable(),
+    discount_mode: z.enum(['percent', 'value']).optional().nullable(),
+    discountValue: z.coerce.number().min(0).optional().nullable(),
+    discount_value: z.coerce.number().min(0).optional().nullable(),
     contents: z
       .string()
       .regex(
@@ -29,11 +36,34 @@ export const productRequestSchema = z
       message: "Invalid product status",
     }),
   })
+  .superRefine((v, ctx) => {
+    const mode = v.discountMode ?? v.discount_mode ?? 'percent';
+    if (mode !== 'percent') return;
+
+    const percent = Number(
+      v.discountPercent ??
+        v.discount_percent ??
+        0,
+    );
+
+    if (Number.isFinite(percent) && percent > 100) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        maximum: 100,
+        type: 'number',
+        inclusive: true,
+        path: ['discountPercent'],
+        message: 'Discount percentage cannot exceed 100',
+      });
+    }
+  })
   .transform((v) => ({
     rowid: v.rowid ?? null,
     name: v.name,
     category: v.category,
     price: v.price,
+    discountMode: v.discountMode ?? v.discount_mode ?? 'percent',
+    discountValue: v.discountValue ?? v.discount_value ?? (v.discountMode === 'value' || v.discount_mode === 'value' ? (v.discountAmount ?? 0) : (v.discount_percent ?? v.discountPercent ?? 0)),
     discountPercent: v.discount_percent ?? v.discountPercent ?? 0,
     contents: v.contents ?? "",
     image: v.image ?? "",

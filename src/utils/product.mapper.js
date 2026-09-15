@@ -12,6 +12,8 @@ export function productResponse(row) {
     price: row.price,
     discountPercent: row.discount_percent,
     discountAmount: row.discount_amount,
+    discountMode: Number(row.discount_percent ?? 0) > 0 ? 'percent' : (Number(row.discount_amount ?? 0) > 0 ? 'value' : 'percent'),
+    discountValue: Number(row.discount_percent ?? 0) > 0 ? row.discount_percent : (row.discount_amount ?? 0),
     amount: row.amount,
     currency: row.currency,
     taxRate: row.tax_rate,

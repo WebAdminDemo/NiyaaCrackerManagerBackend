@@ -20,6 +20,11 @@ const ORDER_COLUMNS = `
   whatsapp_number,
   sms_number,
   total_amount,
+  discount_percent,
+  discount_amount,
+  final_amount,
+  discount_mode,
+  discount_value,
   total_items,
   total_quantity,
   order_date,
@@ -292,9 +297,7 @@ export async function findAllWithItems(db = pool) {
     [ids],
   );
 
-  const byOrder = new Map(
-    orders.map((order) => [order.id, []]),
-  );
+  const byOrder = new Map(orders.map((order) => [order.id, []]));
 
   items.forEach((item) => {
     byOrder.get(item.enquiry_id)?.push(item);
@@ -353,62 +356,19 @@ export async function updateStatus(db = pool, id, status) {
 }
 
 async function adjustStock(client, productId, delta) {
-  if (!delta) return;
-
   const result = await client.query(
-    `
-    SELECT id, name, category, contents, price, amount,
-           discount_percent, brand, status, stock_quantity,
-           ui_flags
-    FROM products
-    WHERE id = $1
-    FOR UPDATE
-    `,
+    `SELECT id, name, category, contents, price, amount, discount_percent, brand, status, stock_quantity, ui_flags
+     FROM products WHERE id = $1 FOR UPDATE`,
     [productId],
   );
-
   const product = result.rows[0];
-
   if (!product) {
     const error = new Error(`Product not found: ${productId}`);
     error.status = 404;
     throw error;
   }
-
-  if (delta > 0) {
-    if (String(product.status || "").toLowerCase() !== "in_stock") {
-      const error = new Error(
-        `${product.name || "Product"} is not available.`,
-      );
-      error.status = 400;
-      throw error;
-    }
-
-    if (
-      product.stock_quantity !== null &&
-      Number(product.stock_quantity) < delta
-    ) {
-      const error = new Error(
-        `Insufficient stock for ${product.name || "Product"}. Available: ${product.stock_quantity}`,
-      );
-      error.status = 400;
-      throw error;
-    }
-  }
-
-  if (product.stock_quantity !== null) {
-    await client.query(
-      `
-      UPDATE products
-      SET stock_quantity = stock_quantity - $1,
-          last_updated = NOW(),
-          updated_at = NOW()
-      WHERE id = $2
-      `,
-      [delta, productId],
-    );
-  }
-
+  // Order quantities are intentionally unlimited. Inventory is informational only
+  // and is never used to reject an order or reduce the catalog stock.
   return product;
 }
 
@@ -443,16 +403,12 @@ export async function updateOrderItems(id, requestedItems = []) {
     const requested = new Map();
 
     for (const item of requestedItems) {
-      const productId = String(
-        item?.productId ?? item?.id ?? "",
-      ).trim();
+      const productId = String(item?.productId ?? item?.id ?? "").trim();
       const quantity = Number(item?.quantity);
 
-      if (
-        !productId ||
-        !Number.isInteger(quantity) ||
-        quantity < 1
-      ) {
+      // Quantity is intentionally unlimited. We only require a positive integer;
+      // there is no stock_quantity or max_order_qty restriction here.
+      if (!productId || !Number.isInteger(quantity) || quantity < 1) {
         const error = new Error(
           "Every selected product must have a quantity greater than zero.",
         );
@@ -461,9 +417,7 @@ export async function updateOrderItems(id, requestedItems = []) {
       }
 
       if (requested.has(productId)) {
-        const error = new Error(
-          `Duplicate product in order: ${productId}`,
-        );
+        const error = new Error(`Duplicate product in order: ${productId}`);
         error.status = 400;
         throw error;
       }
@@ -487,16 +441,9 @@ export async function updateOrderItems(id, requestedItems = []) {
       const productId = String(item.product_id);
       if (requested.has(productId)) continue;
 
-      await adjustStock(
-        client,
-        item.product_id,
-        -Number(item.quantity || 0),
-      );
+      await adjustStock(client, item.product_id, -Number(item.quantity || 0));
 
-      await client.query(
-        `DELETE FROM enquiry_items WHERE id = $1`,
-        [item.id],
-      );
+      await client.query(`DELETE FROM enquiry_items WHERE id = $1`, [item.id]);
     }
 
     // Existing products: only the quantity delta changes stock.
@@ -550,9 +497,7 @@ export async function updateOrderItems(id, requestedItems = []) {
       );
 
       const stockAfter =
-        product.stock_quantity == null
-          ? null
-          : Number(product.stock_quantity) - quantity;
+        product.stock_quantity == null ? null : Number(product.stock_quantity);
 
       await insertSnapshot(
         {
@@ -570,8 +515,8 @@ export async function updateOrderItems(id, requestedItems = []) {
     const totalsResult = await client.query(
       `
       SELECT COUNT(*)::int AS total_items,
-             COALESCE(SUM(quantity), 0)::int AS total_quantity,
-             COALESCE(SUM(total), 0)::numeric(12,2) AS total_amount
+             COALESCE(SUM(quantity), 0)::bigint AS total_quantity,
+             COALESCE(SUM(total), 0)::numeric(30,2) AS total_amount
       FROM enquiry_items
       WHERE enquiry_id = $1
       `,
@@ -580,20 +525,45 @@ export async function updateOrderItems(id, requestedItems = []) {
 
     const totals = totalsResult.rows[0];
 
+    const currentOrderResult = await client.query(
+      `SELECT discount_mode, discount_value FROM enquiries WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    const currentOrder = currentOrderResult.rows[0] || {};
+    const gross = Number(totals.total_amount || 0);
+    const discountMode =
+      currentOrder.discount_mode === "value" ? "value" : "percent";
+    const discountValue = Math.max(0, Number(currentOrder.discount_value || 0));
+    const discountAmount =
+      discountMode === "value"
+        ? discountValue
+        : (gross * Math.min(100, discountValue)) / 100;
+    const finalAmount = gross - discountAmount;
+
     const updatedResult = await client.query(
       `
       UPDATE enquiries
       SET total_items = $1,
           total_quantity = $2,
           total_amount = $3,
+          discount_percent = $4,
+          discount_amount = $5,
+          final_amount = $6,
+          discount_mode = $7,
+          discount_value = $8,
           updated_at = NOW()
-      WHERE id = $4
+      WHERE id = $9
       RETURNING ${ORDER_COLUMNS}
       `,
       [
         totals.total_items,
         totals.total_quantity,
         totals.total_amount,
+        discountMode === "percent" ? Math.min(100, discountValue) : 0,
+        discountAmount,
+        finalAmount,
+        discountMode,
+        discountValue,
         id,
       ],
     );
@@ -704,17 +674,13 @@ export async function updateOrderDetails(
     const requested = new Map();
 
     for (const item of requestedItems || []) {
-      const productId = String(
-        item?.productId ?? item?.id ?? "",
-      ).trim();
+      const productId = String(item?.productId ?? item?.id ?? "").trim();
 
       const quantity = Number(item?.quantity);
 
-      if (
-        !productId ||
-        !Number.isInteger(quantity) ||
-        quantity < 1
-      ) {
+      // Quantity is intentionally unlimited. We only require a positive integer;
+      // there is no stock_quantity or max_order_qty restriction here.
+      if (!productId || !Number.isInteger(quantity) || quantity < 1) {
         const error = new Error(
           "Every selected product must have a quantity greater than zero.",
         );
@@ -723,9 +689,7 @@ export async function updateOrderDetails(
       }
 
       if (requested.has(productId)) {
-        const error = new Error(
-          `Duplicate product in order: ${productId}`,
-        );
+        const error = new Error(`Duplicate product in order: ${productId}`);
         error.status = 400;
         throw error;
       }
@@ -735,10 +699,7 @@ export async function updateOrderDetails(
         originalPrice = 0;
       }
 
-      let discountType =
-        item?.discountType === "value"
-          ? "value"
-          : "percent";
+      let discountType = item?.discountType === "value" ? "value" : "percent";
 
       let discountValue = Number(item?.discountValue);
       if (!Number.isFinite(discountValue) || discountValue < 0) {
@@ -756,19 +717,13 @@ export async function updateOrderDetails(
           ? Math.max(0, originalPrice - discountValue)
           : Math.max(
               0,
-              originalPrice *
-                (1 - Math.min(100, discountValue) / 100),
+              originalPrice * (1 - Math.min(100, discountValue) / 100),
             );
 
-      const discountAmount = Math.max(
-        0,
-        originalPrice - price,
-      );
+      const discountAmount = Math.max(0, originalPrice - price);
 
       const discountPercent =
-        originalPrice > 0
-          ? (discountAmount / originalPrice) * 100
-          : 0;
+        originalPrice > 0 ? (discountAmount / originalPrice) * 100 : 0;
 
       requested.set(productId, {
         quantity,
@@ -786,18 +741,13 @@ export async function updateOrderDetails(
     }
 
     if (!requested.size) {
-      const error = new Error(
-        "An order must contain at least one product.",
-      );
+      const error = new Error("An order must contain at least one product.");
       error.status = 400;
       throw error;
     }
 
     const existingByProduct = new Map(
-      existingItems.map((item) => [
-        String(item.product_id),
-        item,
-      ]),
+      existingItems.map((item) => [String(item.product_id), item]),
     );
 
     // Remove lines that were deselected.
@@ -812,10 +762,9 @@ export async function updateOrderDetails(
         -Number(existing.quantity || 0),
       );
 
-      await client.query(
-        `DELETE FROM enquiry_items WHERE id = $1`,
-        [existing.id],
-      );
+      await client.query(`DELETE FROM enquiry_items WHERE id = $1`, [
+        existing.id,
+      ]);
     }
 
     // Update existing order lines, including the ORDER-SPECIFIC discount.
@@ -829,17 +778,12 @@ export async function updateOrderDetails(
       const delta = requestedItem.quantity - oldQuantity;
 
       if (delta) {
-        await adjustStock(
-          client,
-          existing.product_id,
-          delta,
-        );
+        await adjustStock(client, existing.product_id, delta);
       }
 
-      const lineTotal = (
-        requestedItem.price *
-        requestedItem.quantity
-      ).toFixed(2);
+      const lineTotal = (requestedItem.price * requestedItem.quantity).toFixed(
+        2,
+      );
 
       await client.query(
         `
@@ -882,17 +826,13 @@ export async function updateOrderDetails(
         requestedItem.quantity,
       );
 
-      const catalogOriginalPrice = Number(
-        product.price ?? 0,
-      );
+      const catalogOriginalPrice = Number(product.price ?? 0);
 
       const hasExplicitDiscount =
-        requestedItem.discountType ||
-        requestedItem.discountValue > 0;
+        requestedItem.discountType || requestedItem.discountValue > 0;
 
       const originalPrice =
-        Number.isFinite(catalogOriginalPrice) &&
-        catalogOriginalPrice >= 0
+        Number.isFinite(catalogOriginalPrice) && catalogOriginalPrice >= 0
           ? catalogOriginalPrice
           : requestedItem.originalPrice;
 
@@ -902,37 +842,22 @@ export async function updateOrderDetails(
 
       const discountValue = hasExplicitDiscount
         ? requestedItem.discountValue
-        : Math.max(
-            0,
-            Math.min(
-              100,
-              Number(product.discount_percent ?? 0),
-            ),
-          );
+        : Math.max(0, Math.min(100, Number(product.discount_percent ?? 0)));
 
       const price =
         discountType === "value"
           ? Math.max(0, originalPrice - Math.min(originalPrice, discountValue))
           : Math.max(
               0,
-              originalPrice *
-                (1 - Math.min(100, discountValue) / 100),
+              originalPrice * (1 - Math.min(100, discountValue) / 100),
             );
 
-      const discountAmount = Math.max(
-        0,
-        originalPrice - price,
-      );
+      const discountAmount = Math.max(0, originalPrice - price);
 
       const discountPercent =
-        originalPrice > 0
-          ? (discountAmount / originalPrice) * 100
-          : 0;
+        originalPrice > 0 ? (discountAmount / originalPrice) * 100 : 0;
 
-      const total = (
-        price *
-        requestedItem.quantity
-      ).toFixed(2);
+      const total = (price * requestedItem.quantity).toFixed(2);
 
       await insertItem(
         {
@@ -964,8 +889,7 @@ export async function updateOrderDetails(
           stockAfter:
             product.stock_quantity == null
               ? null
-              : Number(product.stock_quantity) -
-                requestedItem.quantity,
+              : Number(product.stock_quantity),
         },
         client,
       );
@@ -974,8 +898,8 @@ export async function updateOrderDetails(
     const totalsResult = await client.query(
       `
       SELECT COUNT(*)::int AS total_items,
-             COALESCE(SUM(quantity), 0)::int AS total_quantity,
-             COALESCE(SUM(total), 0)::numeric(12,2) AS total_amount
+             COALESCE(SUM(quantity), 0)::bigint AS total_quantity,
+             COALESCE(SUM(total), 0)::numeric(30,2) AS total_amount
       FROM enquiry_items
       WHERE enquiry_id = $1
       `,
@@ -984,62 +908,65 @@ export async function updateOrderDetails(
 
     const totals = totalsResult.rows[0];
 
+    const gross = Number(totals.total_amount || 0);
+    const discountMode =
+      details.discountMode === "value" || details.discount_mode === "value"
+        ? "value"
+        : (details.discountMode ||
+              details.discount_mode ||
+              order.discount_mode ||
+              "percent") === "value"
+          ? "value"
+          : "percent";
+    let discountValue = Number(
+      details.discountValue ??
+        details.discount_value ??
+        (discountMode === "value"
+          ? (order.discount_value ?? order.discount_amount)
+          : order.discount_percent) ??
+        0,
+    );
+    if (!Number.isFinite(discountValue) || discountValue < 0) discountValue = 0;
+    if (discountMode === "percent")
+      discountValue = Math.min(100, discountValue);
+    const discountAmount =
+      discountMode === "value" ? discountValue : (gross * discountValue) / 100;
+    const finalAmount = gross - discountAmount;
+
     const updatedResult = await client.query(
       `
       UPDATE enquiries
-      SET customer_name = $1,
-          customer_phone = $2,
-          customer_address = $3,
-          party_sector = $4,
-          party_country = $5,
-          party_state = $6,
-          party_district = $7,
-          party_locality = $8,
-          party_pincode = $9,
-          brand_mode = $10,
-          status = $11,
-          total_items = $12,
-          total_quantity = $13,
-          total_amount = $14,
-          order_date = $15,
-          updated_at = NOW()
-      WHERE id = $16
+      SET customer_name = $1, customer_phone = $2, customer_address = $3,
+          party_sector = $4, party_country = $5, party_state = $6,
+          party_district = $7, party_locality = $8, party_pincode = $9,
+          brand_mode = $10, status = $11, total_items = $12, total_quantity = $13,
+          total_amount = $14, discount_percent = $15, discount_amount = $16,
+          final_amount = $17, discount_mode = $18, discount_value = $19,
+          order_date = $20, updated_at = NOW()
+      WHERE id = $21
       RETURNING ${ORDER_COLUMNS}
       `,
       [
         customerName,
         customerPhone,
-        details.customerAddress ??
-          order.customer_address ??
-          null,
-        details.partySector ??
-          order.party_sector ??
-          null,
-        details.partyCountry ||
-          order.party_country ||
-          "India",
-        details.partyState ??
-          order.party_state ??
-          null,
-        details.partyDistrict ??
-          order.party_district ??
-          null,
-        details.partyLocality ??
-          order.party_locality ??
-          null,
-        details.partyPincode ??
-          order.party_pincode ??
-          null,
-        details.brandMode ||
-          order.brand_mode ||
-          "multiBrand",
+        details.customerAddress ?? order.customer_address ?? null,
+        details.partySector ?? order.party_sector ?? null,
+        details.partyCountry || order.party_country || "India",
+        details.partyState ?? order.party_state ?? null,
+        details.partyDistrict ?? order.party_district ?? null,
+        details.partyLocality ?? order.party_locality ?? null,
+        details.partyPincode ?? order.party_pincode ?? null,
+        details.brandMode || order.brand_mode || "multiBrand",
         nextStatus,
         totals.total_items,
         totals.total_quantity,
         totals.total_amount,
-        details.orderDate ??
-          order.order_date ??
-          null,
+        discountMode === "percent" ? discountValue : 0,
+        discountAmount,
+        finalAmount,
+        discountMode,
+        discountValue,
+        details.orderDate ?? order.order_date ?? null,
         id,
       ],
     );
@@ -1059,4 +986,3 @@ export async function updateOrderDetails(
     client.release();
   }
 }
-

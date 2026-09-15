@@ -335,6 +335,25 @@ function mapOrder(order) {
 
     brandMode: order.brand_mode || "multiBrand",
 
+    discountMode: order.discount_mode === "value" ? "value" : "percent",
+
+    discountValue: Number(
+      order.discount_value ??
+        (order.discount_mode === "value"
+          ? order.discount_amount
+          : order.discount_percent) ??
+        0,
+    ),
+
+    discountPercent: Number(order.discount_percent ?? 0),
+
+    discountAmount: Number(order.discount_amount ?? 0),
+
+    finalAmount: Number(
+      order.final_amount ??
+        Number(order.total_amount ?? 0) - Number(order.discount_amount ?? 0),
+    ),
+
     channel: order.channel,
 
     status: normalize(order.status, "order_received"),

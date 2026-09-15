@@ -36,7 +36,12 @@ function nullableNumber(value) {
 }
 
 function nullableText(value) {
-  if (value === null || String(value ?? "").trim().toLowerCase() === "null") {
+  if (
+    value === null ||
+    String(value ?? "")
+      .trim()
+      .toLowerCase() === "null"
+  ) {
     return null;
   }
 
@@ -50,74 +55,95 @@ function jsonValue(value, fallback) {
     return jsonText(fallback, fallback);
   }
 
-  return typeof value === "string"
-    ? value
-    : jsonText(value, fallback);
+  return typeof value === "string" ? value : jsonText(value, fallback);
 }
 
-function calculateAmounts(priceValue, discountValue) {
+function calculateAmounts(priceValue, discountValue, discountMode = "percent") {
   const price = nullableNumber(priceValue);
+  const mode =
+    String(discountMode ?? "percent")
+      .trim()
+      .toLowerCase() === "value"
+      ? "value"
+      : "percent";
 
-  // IMPORTANT:
-  // Accept both discountPercent (new API) and discount_percent (old API).
-  const discountPercent = isBlank(discountValue)
-    ? 0
-    : Number(discountValue);
+  let value = isBlank(discountValue) ? 0 : Number(discountValue);
+  if (!Number.isFinite(value) || value < 0) value = 0;
 
-  const safeDiscountPercent =
-    Number.isFinite(discountPercent)
-      ? Math.max(0, Math.min(100, discountPercent))
-      : 0;
+  // 100 is a limit ONLY for percentage discounts.
+  // Fixed-value discounts can be greater than 100.
+  if (mode === "percent") {
+    value = Math.min(100, value);
+  }
 
   if (price === null) {
     return {
       price: null,
-      discountPercent: safeDiscountPercent,
+      discountMode: mode,
+      discountValue: value,
+      discountPercent: mode === "percent" ? value : 0,
       discountAmount: null,
       amount: null,
     };
   }
 
-  const discountAmount = new Decimal(price)
-    .mul(safeDiscountPercent)
-    .div(100)
-    .toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  const original = new Decimal(price);
+  let discountAmount;
 
-  const amount = new Decimal(price)
+  if (mode === "value") {
+    // Do not use Decimal.min(); this also fixes the reported
+    // "(intermediate value).min is not a function" error.
+    const fixedDiscount = new Decimal(value);
+    discountAmount = fixedDiscount.gt(original) ? original : fixedDiscount;
+  } else {
+    discountAmount = original.mul(value).div(100);
+  }
+
+  discountAmount = discountAmount.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+
+  const amount = original
     .minus(discountAmount)
     .toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
 
   return {
     price: money(price),
-    discountPercent: safeDiscountPercent,
+    discountMode: mode,
+    discountValue: value,
+    discountPercent: mode === "percent" ? value : 0,
     discountAmount: money(discountAmount),
     amount: money(amount),
   };
 }
 
 function buildProduct(request, id, now) {
-  const discountValue =
-    request.discountPercent ??
-    request.discount_percent ??
-    0;
+  const discountMode =
+    String(request.discountMode ?? request.discount_mode ?? "percent")
+      .trim()
+      .toLowerCase() === "value"
+      ? "value"
+      : "percent";
 
-  const amounts = calculateAmounts(
-    request.price,
-    discountValue
-  );
+  const discountValue =
+    request.discountValue ??
+    request.discount_value ??
+    (discountMode === "value"
+      ? (request.discountAmount ?? request.discount_amount ?? 0)
+      : (request.discountPercent ?? request.discount_percent ?? 0));
+
+  const amounts = calculateAmounts(request.price, discountValue, discountMode);
 
   return {
     id,
 
-    sku:
-      nullableText(request.sku) ||
-      generateSku(request.name),
+    sku: nullableText(request.sku) || generateSku(request.name),
 
     category: nullableText(request.category),
     name: nullableText(request.name),
     contents: nullableText(request.contents),
 
     price: amounts.price,
+    discountMode: amounts.discountMode,
+    discountValue: amounts.discountValue,
     discountPercent: amounts.discountPercent,
     discountAmount: amounts.discountAmount,
     amount: amounts.amount,
@@ -127,44 +153,29 @@ function buildProduct(request, id, now) {
 
     image: nullableText(request.image),
 
-    tags:
-      request.tags === null
-        ? null
-        : jsonValue(request.tags, []),
+    tags: request.tags === null ? null : jsonValue(request.tags, []),
 
     stockQuantity: nullableNumber(request.stockQuantity),
     minOrderQty: nullableNumber(request.minOrderQty) ?? 1,
     maxOrderQty: nullableNumber(request.maxOrderQty),
 
-    status:
-      nullableText(request.status) ||
-      "in_stock",
+    status: nullableText(request.status) || "in_stock",
 
-    backorderAllowed:
-      request.backorderAllowed ?? false,
+    backorderAllowed: request.backorderAllowed ?? false,
 
-    active:
-      request.active ?? true,
+    active: request.active ?? true,
 
-    crmProductId:
-      nullableText(request.crmProductId),
+    crmProductId: nullableText(request.crmProductId),
 
-    lastUpdated:
-      request.lastUpdated ?? now,
+    lastUpdated: request.lastUpdated ?? now,
 
-    source:
-      nullableText(request.source) || "manual",
+    source: nullableText(request.source) || "manual",
 
-    descriptionVideo:
-      nullableText(request.descriptionVideo),
+    descriptionVideo: nullableText(request.descriptionVideo),
 
-    updatedAt:
-      request.updatedAt ?? now,
+    updatedAt: request.updatedAt ?? now,
 
-    uiFlags:
-      request.uiFlags === null
-        ? null
-        : jsonValue(request.uiFlags, {}),
+    uiFlags: request.uiFlags === null ? null : jsonValue(request.uiFlags, {}),
   };
 }
 
@@ -176,9 +187,7 @@ export async function getProductById(db, id) {
   const row = await findById(db, id);
 
   if (!row) {
-    throw notFound(
-      `Product not found with id: ${id}`
-    );
+    throw notFound(`Product not found with id: ${id}`);
   }
 
   return productResponse(row);
@@ -213,21 +222,14 @@ export async function createProduct(db, request) {
 
   const now = new Date();
 
-  return productResponse(
-    await insert(
-      db,
-      buildProduct(request, id, now)
-    )
-  );
+  return productResponse(await insert(db, buildProduct(request, id, now)));
 }
 
 export async function updateProduct(db, id, request) {
   const existing = await findById(db, id, true);
 
   if (!existing) {
-    throw notFound(
-      `Product not found with id: ${id}`
-    );
+    throw notFound(`Product not found with id: ${id}`);
   }
 
   /*
@@ -245,85 +247,70 @@ export async function updateProduct(db, id, request) {
    *   Recalculate discountAmount and amount from the ORIGINAL price.
    */
 
-  const priceInput =
-    Object.prototype.hasOwnProperty.call(
-      request,
-      "price"
-    )
-      ? request.price
-      : existing.price;
+  const priceInput = Object.prototype.hasOwnProperty.call(request, "price")
+    ? request.price
+    : existing.price;
 
-  const discountInput =
-    Object.prototype.hasOwnProperty.call(
-      request,
-      "discountPercent"
+  const discountMode =
+    String(
+      request.discountMode ??
+        request.discount_mode ??
+        existing.discount_mode ??
+        "percent",
     )
-      ? request.discountPercent
-      : Object.prototype.hasOwnProperty.call(
-          request,
-          "discount_percent"
-        )
-        ? request.discount_percent
+      .trim()
+      .toLowerCase() === "value"
+      ? "value"
+      : "percent";
+
+  const hasDiscountValue =
+    Object.prototype.hasOwnProperty.call(request, "discountValue") ||
+    Object.prototype.hasOwnProperty.call(request, "discount_value");
+
+  const hasDiscountPercent =
+    Object.prototype.hasOwnProperty.call(request, "discountPercent") ||
+    Object.prototype.hasOwnProperty.call(request, "discount_percent");
+
+  const discountInput = hasDiscountValue
+    ? (request.discountValue ?? request.discount_value)
+    : hasDiscountPercent
+      ? (request.discountPercent ?? request.discount_percent)
+      : discountMode === "value"
+        ? existing.discount_amount
         : existing.discount_percent;
 
-  const amounts = calculateAmounts(
-    priceInput,
-    discountInput
-  );
+  const amounts = calculateAmounts(priceInput, discountInput, discountMode);
 
   const now = new Date();
 
   const updated = await update(db, id, {
-    name:
-      Object.prototype.hasOwnProperty.call(
-        request,
-        "name"
-      )
-        ? nullableText(request.name)
-        : existing.name,
+    name: Object.prototype.hasOwnProperty.call(request, "name")
+      ? nullableText(request.name)
+      : existing.name,
 
-    category:
-      Object.prototype.hasOwnProperty.call(
-        request,
-        "category"
-      )
-        ? nullableText(request.category)
-        : existing.category,
+    category: Object.prototype.hasOwnProperty.call(request, "category")
+      ? nullableText(request.category)
+      : existing.category,
 
     price: amounts.price,
 
-    contents:
-      Object.prototype.hasOwnProperty.call(
-        request,
-        "contents"
-      )
-        ? nullableText(request.contents)
-        : existing.contents,
+    contents: Object.prototype.hasOwnProperty.call(request, "contents")
+      ? nullableText(request.contents)
+      : existing.contents,
 
-    image:
-      Object.prototype.hasOwnProperty.call(
-        request,
-        "image"
-      )
-        ? nullableText(request.image)
-        : existing.image,
+    image: Object.prototype.hasOwnProperty.call(request, "image")
+      ? nullableText(request.image)
+      : existing.image,
 
-    status:
-      Object.prototype.hasOwnProperty.call(
-        request,
-        "status"
-      )
-        ? nullableText(request.status)
-        : existing.status,
+    status: Object.prototype.hasOwnProperty.call(request, "status")
+      ? nullableText(request.status)
+      : existing.status,
 
-    discountPercent:
-      amounts.discountPercent,
+    discountPercent: amounts.discountPercent,
 
-    discountAmount:
-      amounts.discountAmount,
+    discountAmount: amounts.discountAmount,
 
-    amount:
-      amounts.amount,
+    amount: amounts.amount,
 
     lastUpdated: now,
     updatedAt: now,
@@ -334,39 +321,22 @@ export async function updateProduct(db, id, request) {
 
 export async function deleteProduct(db, id) {
   if (!(await exists(db, id))) {
-    throw notFound(
-      `Product not found with id: ${id}`
-    );
+    throw notFound(`Product not found with id: ${id}`);
   }
 
   await deleteById(db, id);
 }
 
-export async function updateProductStatus(
-  db,
-  id,
-  status
-) {
-  if (
-    !["in_stock", "no_stock"].includes(status)
-  ) {
+export async function updateProductStatus(db, id, status) {
+  if (!["in_stock", "no_stock"].includes(status)) {
     throw new Error("Invalid status value");
   }
 
   const existing = await findById(db, id, true);
 
   if (!existing) {
-    throw notFound(
-      `Product not found with id: ${id}`
-    );
+    throw notFound(`Product not found with id: ${id}`);
   }
 
-  return productResponse(
-    await repoUpdateStatus(
-      db,
-      id,
-      status,
-      new Date()
-    )
-  );
+  return productResponse(await repoUpdateStatus(db, id, status, new Date()));
 }
